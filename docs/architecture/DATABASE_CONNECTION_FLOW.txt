@@ -1,0 +1,316 @@
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                    DATABASE CONNECTION FLOW DIAGRAM                           ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          1. CONFIGURATION                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  📄 backend/app/config.py                                                   │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │ DATABASE_URL = "postgresql://user:pass@localhost:1234/weather_db" │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Stores: Connection string to PostgreSQL database                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      2. DATABASE CONNECTION SETUP                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  📄 backend/app/database/connection.py                                      │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │ engine = create_engine(DATABASE_URL)  ← Connects to PostgreSQL    │    │
+│  │                                                                     │    │
+│  │ SessionLocal = sessionmaker(bind=engine) ← Creates sessions       │    │
+│  │                                                                     │    │
+│  │ def get_db():                          ← Dependency function       │    │
+│  │     db = SessionLocal()                                            │    │
+│  │     try:                                                            │    │
+│  │         yield db                       ← Give to route handler     │    │
+│  │     finally:                                                        │    │
+│  │         db.close()                     ← Always close              │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Creates: engine, SessionLocal factory, get_db() function                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         3. DATABASE MODELS                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  📄 backend/app/database/models.py                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │ class User(Base):                      ← Defines table structure   │    │
+│  │     __tablename__ = "users"                                        │    │
+│  │     id = Column(Integer, primary_key=True)                         │    │
+│  │     email = Column(String, unique=True)                            │    │
+│  │     comfort_temperature = Column(Float)                            │    │
+│  │     clothing_list = Column(JSON)                                   │    │
+│  │     ...                                                             │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Defines: Python class = SQL table mapping (ORM)                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         4. API ENDPOINTS                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  📄 backend/app/routers/settings.py                                         │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │ @router.get("/{user_id}")                                          │    │
+│  │ def get_user_settings(                                             │    │
+│  │     user_id: int,                      ← From URL                  │    │
+│  │     db: Session = Depends(get_db)      ← FastAPI injects session   │    │
+│  │ ):                                                                  │    │
+│  │     user = db.query(User)              ← Query database            │    │
+│  │              .filter(User.id == user_id)                           │    │
+│  │              .first()                                               │    │
+│  │     return user                        ← Return to frontend         │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Handles: HTTP requests → Database operations → HTTP responses              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         5. MAIN FASTAPI APP                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  📄 backend/app/web.py                                                      │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │ app = FastAPI()                        ← Create app                │    │
+│  │                                                                     │    │
+│  │ app.include_router(auth.router)        ← Register /auth routes    │    │
+│  │ app.include_router(settings.router)    ← Register /settings routes│    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Creates: Main application with all routes                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         6. FRONTEND API CALLS                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  📄 frontend/src/pages/Settings.jsx                                         │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │ const fetchSettings = async (userId) => {                          │    │
+│  │   const response = await fetch(                                    │    │
+│  │     `http://127.0.0.1:8000/settings/${userId}` ← API call          │    │
+│  │   );                                                                │    │
+│  │   const data = await response.json();  ← Parse response            │    │
+│  │   setSettings(data);                   ← Update UI                 │    │
+│  │ }                                                                   │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Makes: HTTP requests to backend API                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                           COMPLETE REQUEST FLOW
+═══════════════════════════════════════════════════════════════════════════════
+
+Step-by-Step: User clicks "Save Settings"
+
+┌─────────────────────┐
+│  1. FRONTEND        │  User clicks "Save Settings" button
+│  Settings.jsx       │  
+└──────────┬──────────┘
+           │
+           │ fetch('http://127.0.0.1:8000/settings/3', {
+           │   method: 'PUT',
+           │   body: JSON.stringify({comfort_temperature: 72})
+           │ })
+           ↓
+┌─────────────────────┐
+│  2. HTTP REQUEST    │  PUT /settings/3
+│  Over Network       │  Content-Type: application/json
+└──────────┬──────────┘  Body: {"comfort_temperature": 72}
+           │
+           │ HTTP arrives at backend
+           ↓
+┌─────────────────────┐
+│  3. FASTAPI         │  FastAPI receives request
+│  web.py             │  Routes to settings.router
+└──────────┬──────────┘
+           │
+           │ Finds matching route: PUT /settings/{user_id}
+           ↓
+┌─────────────────────┐
+│  4. DEPENDENCY      │  FastAPI sees: Depends(get_db)
+│  INJECTION          │  Calls get_db() function
+└──────────┬──────────┘
+           │
+           │ get_db() called
+           ↓
+┌─────────────────────┐
+│  5. GET SESSION     │  db = SessionLocal()
+│  connection.py      │  Creates new database session
+└──────────┬──────────┘  Opens connection to PostgreSQL
+           │
+           │ Session ready, pass to route handler
+           ↓
+┌─────────────────────┐
+│  6. ROUTE HANDLER   │  def update_user_settings(user_id, settings, db):
+│  settings.py        │      user = db.query(User).filter(...)
+└──────────┬──────────┘
+           │
+           │ db.query(User)...
+           ↓
+┌─────────────────────┐
+│  7. SQLALCHEMY ORM  │  Converts Python → SQL
+│  models.py          │  SELECT * FROM users WHERE id = 3
+└──────────┬──────────┘
+           │
+           │ SQL query sent
+           ↓
+┌─────────────────────┐
+│  8. POSTGRESQL      │  Executes: SELECT * FROM users WHERE id = 3
+│  Database           │  Returns: Row with user data
+└──────────┬──────────┘
+           │
+           │ Row data returned
+           ↓
+┌─────────────────────┐
+│  9. SQLALCHEMY ORM  │  Converts SQL row → Python User object
+│  models.py          │  user.comfort_temperature = 72
+└──────────┬──────────┘
+           │
+           │ db.commit() called
+           ↓
+┌─────────────────────┐
+│ 10. POSTGRESQL      │  Executes: UPDATE users 
+│  Database           │            SET comfort_temperature = 72
+└──────────┬──────────┘            WHERE id = 3
+           │
+           │ Update confirmed
+           ↓
+┌─────────────────────┐
+│ 11. ROUTE HANDLER   │  return user
+│  settings.py        │  (User object)
+└──────────┬──────────┘
+           │
+           │ FastAPI converts User object → JSON
+           ↓
+┌─────────────────────┐
+│ 12. HTTP RESPONSE   │  HTTP/1.1 200 OK
+│  Over Network       │  Content-Type: application/json
+└──────────┬──────────┘  Body: {"id": 3, "comfort_temperature": 72, ...}
+           │
+           │ Response arrives at frontend
+           ↓
+┌─────────────────────┐
+│ 13. FRONTEND        │  data = await response.json()
+│  Settings.jsx       │  setSettings(data)
+└──────────┬──────────┘  React re-renders UI
+           │
+           │ User sees: "Comfort Temperature: 72°F"
+           ↓
+        ┌─────┐
+        │ DONE│
+        └─────┘
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                           KEY COMPONENT ROLES
+═══════════════════════════════════════════════════════════════════════════════
+
+┌──────────────────────┬───────────────────────────────────────────────────┐
+│ Component            │ Role                                              │
+├──────────────────────┼───────────────────────────────────────────────────┤
+│ config.py            │ Stores database connection string                 │
+├──────────────────────┼───────────────────────────────────────────────────┤
+│ connection.py        │ Creates engine, session factory, get_db()         │
+│ - engine             │ Manages PostgreSQL connection pool                │
+│ - SessionLocal       │ Factory for creating database sessions            │
+│ - get_db()           │ Provides session to route handlers                │
+├──────────────────────┼───────────────────────────────────────────────────┤
+│ models.py            │ Defines table structure (User class)              │
+│ - User class         │ Maps to 'users' table in PostgreSQL               │
+├──────────────────────┼───────────────────────────────────────────────────┤
+│ routers/settings.py  │ API endpoints for settings operations             │
+│ - get_user_settings  │ GET /settings/{user_id}                           │
+│ - update_settings    │ PUT /settings/{user_id}                           │
+├──────────────────────┼───────────────────────────────────────────────────┤
+│ web.py               │ Main FastAPI app, registers all routers           │
+├──────────────────────┼───────────────────────────────────────────────────┤
+│ Settings.jsx         │ Frontend UI, makes API calls                      │
+│ - fetchSettings()    │ Calls GET /settings/{user_id}                     │
+│ - handleSave()       │ Calls PUT /settings/{user_id}                     │
+└──────────────────────┴───────────────────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                           SESSION LIFECYCLE
+═══════════════════════════════════════════════════════════════════════════════
+
+   Request Arrives
+         │
+         ↓
+   ┌─────────────────┐
+   │ get_db() called │
+   └────────┬────────┘
+            │
+            ├→ db = SessionLocal()  ← Create session
+            │
+            ├→ yield db             ← Give to route handler
+            │                          
+            │  [Route handler uses db to query/update]
+            │  
+            ├→ db.commit()          ← Save changes (if any)
+            │  
+            └→ db.close()           ← Close session (always!)
+         
+   Response Sent
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                     SQLALCHEMY ORM OPERATIONS
+═══════════════════════════════════════════════════════════════════════════════
+
+┌─────────────────────┬──────────────────────────────────────────────────┐
+│ Python Code         │ Generated SQL                                    │
+├─────────────────────┼──────────────────────────────────────────────────┤
+│ db.query(User)      │ SELECT * FROM users                              │
+├─────────────────────┼──────────────────────────────────────────────────┤
+│ .filter(            │ WHERE id = 3                                     │
+│   User.id == 3      │                                                  │
+│ )                   │                                                  │
+├─────────────────────┼──────────────────────────────────────────────────┤
+│ .first()            │ LIMIT 1                                          │
+├─────────────────────┼──────────────────────────────────────────────────┤
+│ user.temperature=72 │ (No SQL yet, just in memory)                    │
+├─────────────────────┼──────────────────────────────────────────────────┤
+│ db.commit()         │ UPDATE users SET comfort_temperature = 72       │
+│                     │ WHERE id = 3                                     │
+├─────────────────────┼──────────────────────────────────────────────────┤
+│ db.add(new_user)    │ INSERT INTO users (...) VALUES (...)            │
+│ db.commit()         │                                                  │
+├─────────────────────┼──────────────────────────────────────────────────┤
+│ db.delete(user)     │ DELETE FROM users WHERE id = 3                  │
+│ db.commit()         │                                                  │
+└─────────────────────┴──────────────────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                           SUMMARY
+═══════════════════════════════════════════════════════════════════════════════
+
+1. config.py          → Stores database URL
+2. connection.py      → Creates engine & get_db()
+3. models.py          → Defines User class (table structure)
+4. routers/settings.py → API endpoints that use get_db()
+5. web.py             → Registers all routes
+6. Settings.jsx       → Makes fetch() calls
+
+Key Magic: Depends(get_db)
+- FastAPI automatically calls get_db()
+- Provides database session to route handler
+- Closes session when done (even if error)
+
+Flow: Frontend → HTTP → FastAPI → get_db() → Session → ORM → SQL → PostgreSQL
+Return: PostgreSQL → SQL Results → ORM → Python Objects → JSON → HTTP → Frontend
+
+═══════════════════════════════════════════════════════════════════════════════
+

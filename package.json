@@ -1,0 +1,15 @@
+{
+  "dependencies": {
+    "@heroui/avatar": "^2.2.24",
+    "@heroui/input": "^2.4.30",
+    "@heroui/modal": "^2.2.26",
+    "@heroui/react": "^2.8.7",
+    "@heroui/select": "^2.4.30",
+    "@heroui/theme": "^2.4.25",
+    "autoprefixer": "^10.4.23",
+    "framer-motion": "^12.24.7",
+    "postcss": "^8.5.6",
+    "react-router-dom": "^7.13.0",
+    "tailwindcss": "^4.1.18"
+  }
+}
