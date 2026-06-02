@@ -10,7 +10,12 @@ Formula: comfort_score = (temperature_score * wind_multiplier) + forecast_score
 Higher scores indicate more comfortable conditions (warmer, less wind, better forecast).
 Lower scores indicate less comfortable conditions (colder, windy, poor forecast).
 """
-from src.config.common import FORECAST_SCORES, COMFORT_TEMPERATURE
+from src.config.common import (
+    FORECAST_SCORES,
+    COMFORT_TEMPERATURE,
+    COLD_PENALTY_PER_DEGREE,
+    HEAT_PENALTY_PER_DEGREE,
+)
 
 # --- Temperature score (°F)------------------------
 def score_temperature(temperature, comfort_temperature=None):
@@ -95,89 +100,66 @@ def wind_multiplier(wind_speed, start=5.0, step=0.1, floor=0.0):
 
 
 
-def score_weather(weather, comfort_temperature=None):
+def score_weather(
+    weather,
+    comfort_temperature=None,
+    cold_penalty_per_degree=None,
+    heat_penalty_per_degree=None,
+):
     """
-    Calculate overall comfort score from weather conditions.
-    
-    Combines temperature, wind speed, and forecast conditions into a single
-    comfort score normalized to 0-10 scale. The score is used to determine 
-    appropriate clothing layers.
-    
-    Formula:
-        raw_score = (temperature_score * wind_multiplier) + forecast_score
-        comfort_score = clamp(raw_score, 0, 10)
-    
-    Where:
-        - temperature_score: Based on deviation from comfort temperature
-        - wind_multiplier: Reduces score for high wind speeds (0.1 increments)
-        - forecast_score: Bonus/penalty based on forecast conditions
-        - Result is clamped to 0-10 range (no negative values)
-    
-    Args:
-        weather: Weather object with methods:
-            - get_temperature(): Returns temperature in Fahrenheit
-            - get_wind_speed(): Returns wind speed in mph
-            - get_short_forecast(): Returns forecast description string
-        comfort_temperature: User's preferred comfort temperature (default: uses COMFORT_TEMPERATURE constant)
-            
-    Returns:
-        float: Comfort score between 0 and 10 (higher = more comfortable)
-               0 = Very uncomfortable (cold/hot, windy, poor conditions)
-               10 = Perfect comfort (ideal temp, calm, clear weather)
-        
-    Example:
-        For 70°F, 5 mph wind, "sunny":
-        - temperature_score = 10.0
-        - wind_multiplier = 1.0
-        - forecast_score = 0 (normalized)
-        - Raw score = 10.0 * 1.0 + 0 = 10.0
-        - Final score = clamp(10.0, 0, 10) = 10.0
-        
-        For 43°F, 20 mph wind, "mostly sunny":
-        - temperature_score = -3.5
-        - wind_multiplier = 0.0 (15 mph above threshold)
-        - forecast_score = 0
-        - Raw score = -3.5 * 0.0 + 0 = 0.0
-        - Final score = clamp(0.0, 0, 10) = 0.0
-        
-        For 60°F, 8 mph wind, "partly cloudy":
-        - temperature_score = 5.0
-        - wind_multiplier = 0.7 (3 mph above threshold = 0.3 penalty)
-        - forecast_score = 0
-        - Raw score = 5.0 * 0.7 + 0 = 3.5
-        - Final score = clamp(3.5, 0, 10) = 3.5
-    """
-    # Calculate base temperature score (-10 to +10 range)
-    temperature = score_temperature(weather.get_temperature(), comfort_temperature)
-    wind_speed = weather.get_wind_speed() 
-    short_forecast = weather.get_short_forecast()
+    Calculate overall comfort score from weather conditions (0–10 scale).
 
-    # Apply wind multiplier to temperature score (0.0 to 1.0)
-    # Wind reduces comfort, especially in cold conditions
-    wind_multiplier_score = wind_multiplier(weather.get_wind_speed()) 
-    temperature_score = temperature * wind_multiplier_score
-    
-    # Normalize temperature score to 0-10 range
-    # Original range is -10 to +10, shift to 0-20, then scale to 0-10
-    normalized_temp_score = (temperature_score + 10.0) / 2.0
-    
-    # Forecast adjustment (small modifier, ±1 point)
-    # Simplified from large bonuses to minor adjustments
-    forecast_modifier = 0
-    if short_forecast and isinstance(short_forecast, str):
-        forecast_lower = short_forecast.lower()
-        if any(word in forecast_lower for word in ['sunny', 'clear']):
-            forecast_modifier = 0.5
-        elif any(word in forecast_lower for word in ['cloudy', 'overcast']):
-            forecast_modifier = -0.25
-        elif any(word in forecast_lower for word in ['rain', 'snow', 'storm']):
-            forecast_modifier = -0.5
-    
-    # Combine normalized temperature with forecast modifier
-    score = normalized_temp_score + forecast_modifier
-    
-    # Clamp final score to 0-10 range
-    score = max(0.0, min(10.0, score))
-    
-    return score
+    Additive model (SC2 fix — removed the (score + 10)/2 normalization that
+    produced a phantom +5 floor whenever wind_mult zeroed the temperature score):
+
+        temp_penalty  = cold_slope * (comfort - temp)   if temp < comfort  (cold side)
+                      | heat_slope * (temp - comfort)   if temp >= comfort (hot side)
+        wind_penalty  = max(0.0, 0.1 * (wind - 5))      # 0 below 5 mph, 1.0 at 15 mph
+        forecast_mod  = +0.5 (sunny/clear)
+                      | -0.25 (cloudy/overcast)
+                      | -0.5  (rain/snow/storm)
+                      |  0    (other)
+        score = clamp(10.0 - temp_penalty - wind_penalty + forecast_mod, 0, 10)
+
+    SC3 — asymmetric comfort: cold_penalty_per_degree / heat_penalty_per_degree
+    let cold and hot deviations be weighted differently (e.g. a heat-sensitive
+    user). Both default to the symmetric 0.5/°F, so omitting them reproduces the
+    original behavior exactly.
+
+    Examples (symmetric defaults):
+        70°F / 0 mph / sunny  (comfort 70°F) → 10 - 0 - 0 + 0.5 → 10.0
+        43°F / 20 mph / clear (comfort 70°F) → 10 - 13.5 - 1.5 + 0.5 → 0.0
+        5°F  / 30 mph / rain  (comfort 70°F) → 10 - 32.5 - 2.5 - 0.5 → 0.0
+        60°F / 5 mph  / cloudy(comfort 70°F) → 10 - 5 - 0 - 0.25 → 4.75
+    """
+    if comfort_temperature is None:
+        comfort_temperature = COMFORT_TEMPERATURE
+    if cold_penalty_per_degree is None:
+        cold_penalty_per_degree = COLD_PENALTY_PER_DEGREE
+    if heat_penalty_per_degree is None:
+        heat_penalty_per_degree = HEAT_PENALTY_PER_DEGREE
+
+    temp   = float(weather.get_temperature())
+    wind   = float(weather.get_wind_speed())
+    fcast  = weather.get_short_forecast() or ""
+    comfort = float(comfort_temperature)
+
+    if temp < comfort:
+        temp_penalty = cold_penalty_per_degree * (comfort - temp)
+    else:
+        temp_penalty = heat_penalty_per_degree * (temp - comfort)
+    wind_penalty = max(0.0, 0.1 * (wind - 5.0))
+
+    forecast_mod = 0.0
+    if isinstance(fcast, str):
+        fl = fcast.lower()
+        if any(w in fl for w in ("sunny", "clear")):
+            forecast_mod = 0.5
+        elif any(w in fl for w in ("cloudy", "overcast")):
+            forecast_mod = -0.25
+        elif any(w in fl for w in ("rain", "snow", "storm")):
+            forecast_mod = -0.5
+
+    score = 10.0 - temp_penalty - wind_penalty + forecast_mod
+    return max(0.0, min(10.0, score))
 

@@ -17,6 +17,14 @@ Constants include:
 # Users can override this via API parameter (future feature)
 COMFORT_TEMPERATURE = 70
 
+# SC3 — asymmetric comfort. Penalty applied to the comfort score per °F that the
+# temperature deviates from comfort, separately for the cold side (below comfort)
+# and the hot side (above comfort). Equal by default → symmetric scoring, i.e.
+# the original 0.5/°F behavior. Per-user heat/cold tolerance can later override
+# these (a higher tolerance in one direction = a smaller penalty slope there).
+COLD_PENALTY_PER_DEGREE = 0.5
+HEAT_PENALTY_PER_DEGREE = 0.5
+
 # Forecast condition scores
 # These scores are added to the temperature score to calculate final comfort score
 # Positive scores indicate pleasant conditions, negative scores indicate adverse conditions

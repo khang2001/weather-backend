@@ -1,62 +1,69 @@
-# weather.py
-# Wrapper around the NWS client. Safe for new devs: imports are explicit, getters are defensive.
+# weather.py — Weather value object (A1 refactor)
+#
+# Constructor now takes a pre-fetched data dict (never blocks).
+# Use the async classmethod Weather.fetch() to create from NWS.
+# Use Weather.from_cache() to create from a cached dict — zero network calls.
 
-from src.clients.nws_client import get_current_conditions  # <-- REQUIRED import
+from __future__ import annotations
+
 
 class Weather:
-    def __init__(self, latitude, longitude):
-        """
-        Create a Weather object and immediately fetch NWS data.
-        If the fetch fails, weather_data becomes {} so getters won't crash.
-        """
+    def __init__(self, weather_data: dict, latitude: float, longitude: float) -> None:
         self.latitude = latitude
         self.longitude = longitude
-        self.score = 0  # clothing/comfort score you compute later
+        self.weather_data = weather_data
+        self.score = 0.0
 
+    # -- Factories -------------------------------------------------------------
+
+    @classmethod
+    async def fetch(cls, latitude: float, longitude: float) -> "Weather":
+        """Fetch from NWS (async). Returns an empty-data instance on failure."""
+        from src.clients.nws_client import get_current_conditions
         try:
-            self.weather_data = get_current_conditions(latitude, longitude)
-        except Exception as e:
-            # Keep the object usable even if network fails
-            print(f"Could not retrieve weather data: {e}")
-            self.weather_data = {}
+            data = await get_current_conditions(latitude, longitude)
+        except Exception as exc:
+            print(f"Weather.fetch failed for ({latitude}, {longitude}): {exc}")
+            data = {}
+        return cls(data, latitude, longitude)
 
-    def __str__(self):
-        """
-        Human-friendly summary. Uses safe getters so it won't crash if data is missing.
-        """
-        return (f"Weather at ({self.latitude}, {self.longitude}): "
-                f"{self.get_temperature():.1f}°F, {self.get_short_forecast()}, "
-                f"wind {self.get_wind_speed():.1f} mph.")
+    @classmethod
+    def from_cache(cls, weather_data: dict, latitude: float, longitude: float) -> "Weather":
+        """Build from a cached dict — no network call."""
+        return cls(weather_data, latitude, longitude)
 
-    # ---- Quick health check ---------------------------------------------------
-    def is_ready(self):
-        """True if we have non-empty weather data."""
+    # -- Accessors -------------------------------------------------------------
+
+    def is_ready(self) -> bool:
         return bool(self.weather_data)
 
-    # ---- Accessors (defensive: use .get with defaults) -----------------------
-    def get_weather_data(self):
+    def get_weather_data(self) -> dict:
         return self.weather_data
 
-    def get_temperature(self):
-        # Default 0.0 if missing so downstream math doesn't explode
+    def get_temperature(self) -> float:
         return float(self.weather_data.get("temp_f", 0.0))
 
-    def get_temperature_celsius(self):
+    def get_temperature_celsius(self) -> float:
         return (self.get_temperature() - 32.0) * 5.0 / 9.0
 
-    def get_wind_speed(self):
+    def get_wind_speed(self) -> float:
         return float(self.weather_data.get("wind_mph", 0.0))
 
-    def get_short_forecast(self):
+    def get_short_forecast(self) -> str:
         return self.weather_data.get("short_forecast", "No forecast available").lower()
 
-    def get_period_start(self):
+    def get_period_start(self) -> str:
         return self.weather_data.get("period_start", "Unknown")
 
-    # ---- Scoring --------------------------------------------------------------
-    def get_score(self):
+    def get_score(self) -> float:
         return self.score
 
-    def set_score(self, score):
+    def set_score(self, score: float) -> None:
         self.score = score
 
+    def __str__(self) -> str:
+        return (
+            f"Weather at ({self.latitude}, {self.longitude}): "
+            f"{self.get_temperature():.1f}°F, {self.get_short_forecast()}, "
+            f"wind {self.get_wind_speed():.1f} mph."
+        )

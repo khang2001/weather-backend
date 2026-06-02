@@ -9,7 +9,7 @@ Current models:
 - WeatherCache: Caches weather data to reduce API calls
 - Recommendation: Stores recommendation history
 """
-from sqlalchemy import Column, Integer, Float, String, DateTime, JSON, ForeignKey
+from sqlalchemy import Column, Integer, Float, String, DateTime, JSON, ForeignKey, Index, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database.connection import Base
@@ -50,14 +50,21 @@ class User(Base):
     # User information
     name = Column(String, nullable=True)  # Optional display name
     comfort_temperature = Column(Float, default=70.0, nullable=False)
+
+    # SC3 — per-user asymmetric comfort. Penalty-per-°F on each side of the
+    # comfort temperature (cold = below, heat = above). 0.5/0.5 = symmetric.
+    cold_penalty_per_degree = Column(Float, default=0.5, nullable=False)
+    heat_penalty_per_degree = Column(Float, default=0.5, nullable=False)
     
     # Location settings (optional - legacy single location)
     saved_latitude = Column(Float, nullable=True)  # User's saved location latitude
     saved_longitude = Column(Float, nullable=True)  # User's saved location longitude
     location_name = Column(String, nullable=True)  # User-friendly location name (e.g., "Home", "New York")
     
-    # Multiple saved locations (stored as JSON)
-    # Format: [{"name": "Home", "latitude": 40.7128, "longitude": -74.006, "color": "primary"}, ...]
+    # Multiple saved locations — DB1: normalized into the user_saved_locations
+    # table (see SavedLocation, relationship `saved_location_rows`). This JSON
+    # column is legacy/deprecated; kept only so the migration can read existing
+    # data. Responses are now built from the normalized rows.
     saved_locations = Column(JSON, nullable=True, default=list)
     
     # Clothing preferences (stored as JSON)
@@ -71,36 +78,33 @@ class User(Base):
     # Relationships: One user can have many recommendations
     recommendations = relationship("Recommendation", back_populates="user")
 
+    # DB1: normalized saved locations (ordered by insertion id to preserve the
+    # index-based API contract). Cascade so deleting a user removes their rows.
+    saved_location_rows = relationship(
+        "SavedLocation",
+        back_populates="user",
+        order_by="SavedLocation.id",
+        cascade="all, delete-orphan",
+    )
+
 
 class WeatherCache(Base):
     """
     Cache for weather data to reduce API calls.
-    
-    Stores weather data temporarily to avoid excessive calls to the National
-    Weather Service API. Weather data is cached by location (latitude/longitude)
-    and expires after a set time period.
-    
-    Attributes:
-        id: Primary key, auto-incrementing integer
-        latitude: Latitude coordinate (indexed for fast lookups)
-        longitude: Longitude coordinate (indexed for fast lookups)
-        weather_data: Full weather response stored as JSON
-        cached_at: Timestamp when data was cached (auto-set)
-        expires_at: Timestamp when cache entry expires (required)
+
+    DB2: UNIQUE(latitude, longitude) prevents stampede duplicates and enables UPSERT.
+    DB3: Index on expires_at so expiry filter doesn't do a full scan.
     """
     __tablename__ = "weather_cache"
+    __table_args__ = (
+        UniqueConstraint("latitude", "longitude", name="uq_weather_cache_lat_lon"),
+        Index("ix_weather_cache_expires_at", "expires_at"),
+    )
 
-    # Primary key
     id = Column(Integer, primary_key=True, index=True)
-    
-    # Location coordinates (indexed for efficient lookups)
-    latitude = Column(Float, nullable=False, index=True)
-    longitude = Column(Float, nullable=False, index=True)
-    
-    # Cached weather data stored as JSON
-    weather_data = Column(JSON, nullable=False)  # Stores full weather response
-    
-    # Timestamps
+    latitude = Column(Float, nullable=False)
+    longitude = Column(Float, nullable=False)
+    weather_data = Column(JSON, nullable=False)
     cached_at = Column(DateTime(timezone=True), server_default=func.now())
     expires_at = Column(DateTime(timezone=True), nullable=False)
 
@@ -148,4 +152,36 @@ class Recommendation(Base):
 
     # Relationships: Many recommendations can belong to one user (optional)
     user = relationship("User", back_populates="recommendations")
+
+
+class SavedLocation(Base):
+    """
+    DB1 — a user's saved location, normalized out of the old JSON blob.
+
+    One row per saved location. The B-tree index on (latitude, longitude) makes
+    coordinate lookups indexed rather than a full JSON scan.
+
+    Attributes:
+        id: Primary key.
+        user_id: Owning user (FK, indexed).
+        name: User-facing label (unique per user, enforced in the router).
+        latitude / longitude: Coordinates.
+        color / icon: UI presentation hints (match the frontend's options).
+        created_at: Insertion timestamp.
+    """
+    __tablename__ = "user_saved_locations"
+    __table_args__ = (
+        Index("ix_user_saved_locations_lat_lon", "latitude", "longitude"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name = Column(String, nullable=False)
+    latitude = Column(Float, nullable=False)
+    longitude = Column(Float, nullable=False)
+    color = Column(String, nullable=False, default="primary")
+    icon = Column(String, nullable=False, default="pin")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="saved_location_rows")
 

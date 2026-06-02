@@ -15,20 +15,30 @@ The application integrates with:
 """
 import sys
 import os
+import logging
 
 # Add backend root to Python path to enable imports from app and src directories
 backend_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if backend_root not in sys.path:
     sys.path.insert(0, backend_root)
 
-from fastapi import FastAPI, Depends, HTTPException, Query
+from datetime import datetime, timedelta, timezone
+
+import pybreaker
+from fastapi import APIRouter, BackgroundTasks, FastAPI, Depends, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import Session
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from app.config import APP_NAME, APP_VERSION
 from app.database import get_db, Base, engine
+from app.database.connection import SessionLocal
+from app.database.models import WeatherCache
 from app.api.schemas import (
     HealthResponse,
     WeatherResponse,
@@ -39,18 +49,100 @@ from app.api.schemas import (
     UserResponse
 )
 from app.routers import auth, settings
+from src.clients.nws_client import get_current_conditions
 from src.domain.models.weather import Weather
 from src.services.scoring.weather_scoring import score_weather
 from src.services.scoring.clothing_scoring import recommend_clothing
 
+CACHE_TTL_MINUTES = 15
+
+
+def _cache_lookup(db: Session, lat: float, lon: float):
+    """Return a fresh WeatherCache row or None."""
+    return (
+        db.query(WeatherCache)
+        .filter(
+            WeatherCache.latitude == lat,
+            WeatherCache.longitude == lon,
+            WeatherCache.expires_at > datetime.now(timezone.utc),
+        )
+        .order_by(WeatherCache.cached_at.desc())
+        .first()
+    )
+
+
+def _cache_upsert(db: Session, lat: float, lon: float, data: dict) -> None:
+    """UPSERT weather data into cache with a 15-min TTL."""
+    now = datetime.now(timezone.utc)
+    stmt = (
+        pg_insert(WeatherCache)
+        .values(
+            latitude=lat,
+            longitude=lon,
+            weather_data=data,
+            cached_at=now,
+            expires_at=now + timedelta(minutes=CACHE_TTL_MINUTES),
+        )
+        .on_conflict_do_update(
+            constraint="uq_weather_cache_lat_lon",
+            set_={
+                "weather_data": data,
+                "cached_at": now,
+                "expires_at": now + timedelta(minutes=CACHE_TTL_MINUTES),
+            },
+        )
+    )
+    db.execute(stmt)
+    db.commit()
+
+
+def _save_recommendation(
+    lat: float,
+    lon: float,
+    comfort_temp: float,
+    weather_data: dict,
+    comfort_score: float,
+    clothing_items: list,
+    user_id: Optional[int] = None,
+) -> None:
+    """A3 — persist a Recommendation row (history). Runs as a fire-and-forget
+    BackgroundTask, so it opens its OWN session: by the time it executes, the
+    request-scoped session has already been closed. Failures are logged and
+    swallowed so history-write problems never surface to the user."""
+    from app.database.models import Recommendation
+
+    db = None
+    try:
+        db = SessionLocal()
+        db.add(
+            Recommendation(
+                user_id=user_id,
+                latitude=lat,
+                longitude=lon,
+                comfort_temperature=comfort_temp,
+                weather_data=weather_data,
+                comfort_score=comfort_score,
+                clothing_recommendations=clothing_items,
+            )
+        )
+        db.commit()
+    except Exception:
+        logger.exception("Failed to persist recommendation history for lat=%s lon=%s", lat, lon)
+        if db is not None:
+            db.rollback()
+    finally:
+        if db is not None:
+            db.close()
+
+
 # Create database tables (in production, use Alembic migrations)
 # Wrap in try-except so server can start even if database isn't available
 try:
-    # Clear metadata cache to ensure fresh table definitions
-    Base.metadata.clear()
-    # Import models to register them with Base
-    from app.database.models import User, WeatherCache, Recommendation
-    # Create tables
+    # Import models to register them on Base.metadata, then create tables.
+    # NOTE: do NOT call Base.metadata.clear() here — models are already imported
+    # (via app.database package init), so a clear() empties the registry and the
+    # cached re-import does not re-populate it, leaving create_all() a silent no-op.
+    from app.database.models import User, WeatherCache, Recommendation  # noqa: F401
     Base.metadata.create_all(bind=engine)
     print("✓ Database tables created/verified")
 except Exception as e:
@@ -64,18 +156,27 @@ app = FastAPI(
     description="API for weather-based clothing recommendations"
 )
 
-# CORS middleware (adjust origins for production)
+# S3 — CORS locked to the deployed frontend origin
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify actual origins
+    allow_origins=["https://khang2001.github.io"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
-# Include routers
-app.include_router(auth.router)
-app.include_router(settings.router)
+
+# F2 — catch any unhandled exception; log server-side, return generic body
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception("Unhandled exception on %s %s", request.method, request.url)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+# D3 — API versioning. Business routes attach to this router, which is mounted
+# twice at the bottom of the file: legacy unprefixed (e.g. /score) AND under /v1
+# (e.g. /v1/score). Health/root stay on `app` directly and are never versioned —
+# load-balancer probes target a stable, unversioned path.
+api_router = APIRouter()
 
 
 # Health Check Endpoint
@@ -113,209 +214,122 @@ def health_check(db: Session = Depends(get_db)):
     )
 
 
-# Score Endpoint (main endpoint for frontend)
-@app.get("/score", response_model=RecommendationResponse)
-@app.post("/score", response_model=RecommendationResponse)
-def get_score(
-    latitude: Optional[float] = Query(None, ge=-90, le=90),
-    longitude: Optional[float] = Query(None, ge=-180, le=180),
-    comfort_temperature: Optional[float] = Query(None, ge=50, le=90),
+# Score Endpoint — POST only (D1), canonical scoring route (D2), cache-first (A1, A2, A4)
+@api_router.post("/score", response_model=RecommendationResponse)
+async def get_score(
+    background_tasks: BackgroundTasks,
     request: Optional[RecommendationRequest] = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    """
-    Get clothing recommendations based on weather conditions.
-    
-    This is the main endpoint used by the frontend. It fetches current weather
-    data for the given coordinates, calculates a comfort score, and generates
-    appropriate clothing recommendations.
-    
-    Can be called via GET (query params) or POST (JSON body).
-    
-    Args:
-        latitude: Latitude coordinate (-90 to 90). Required for GET requests.
-        longitude: Longitude coordinate (-180 to 180). Required for GET requests.
-        comfort_temperature: Optional personal comfort temperature in Fahrenheit (50-90°F).
-                           Defaults to 70°F if not provided.
-        request: Optional RecommendationRequest object for POST requests.
-        db: Database session dependency (injected by FastAPI).
-        
-    Returns:
-        RecommendationResponse: Contains:
-            - weather: Current weather conditions (temp, wind, forecast, location)
-            - comfort_score: Calculated comfort score (higher = more comfortable)
-            - clothing_recommendations: List of recommended clothing items
-            - location: Input coordinates
-            
-    Raises:
-        HTTPException 400: If latitude/longitude are missing
-        HTTPException 404: If weather data is not available for the location
-        HTTPException 500: If there's an error fetching weather or generating recommendations
-        
-    Example GET:
-        GET /score?latitude=40.7128&longitude=-74.0060&comfort_temperature=70
-        
-    Example POST:
-        POST /score
-        Body: {"latitude": 40.7128, "longitude": -74.0060, "comfort_temperature": 70}
-    """
-    # Handle both GET (query params) and POST (body) request formats
-    if request:
-        lat = request.latitude
-        lon = request.longitude
-        comfort_temp = request.comfort_temperature
-    else:
-        if latitude is None or longitude is None:
-            raise HTTPException(
-                status_code=400,
-                detail="latitude and longitude are required"
-            )
-        lat = latitude
-        lon = longitude
-        comfort_temp = comfort_temperature
-    
+    # Coordinates come from the JSON body. A missing body is a client error.
+    if request is None:
+        raise HTTPException(status_code=400, detail="latitude and longitude are required")
+    lat, lon, comfort_temp = request.latitude, request.longitude, request.comfort_temperature
+    cold_penalty = request.cold_penalty_per_degree
+    heat_penalty = request.heat_penalty_per_degree
+
+    if comfort_temp is None:
+        from src.config.common import COMFORT_TEMPERATURE
+        comfort_temp = COMFORT_TEMPERATURE
+
     try:
-        # Fetch current weather data from National Weather Service API
-        weather = Weather(lat, lon)
-        if not weather.is_ready():
-            raise HTTPException(
-                status_code=404,
-                detail="Weather data not available for this location"
-            )
-        
-        # Use default comfort temperature if not provided
-        if comfort_temp is None:
-            from src.config.common import COMFORT_TEMPERATURE
-            comfort_temp = COMFORT_TEMPERATURE
-        
-        # Calculate comfort score based on temperature, wind, and forecast
-        # The score considers deviation from comfort temperature and weather conditions
-        comfort_score = score_weather(weather, comfort_temperature=comfort_temp)
-        
-        # Generate clothing recommendations based on temperature deviation and wind
-        # Layers are calculated as: 1 + floor((comfort_temp - actual_temp) / 20) + wind_adjustment
-        clothing_recs = recommend_clothing(
-            comfort_temperature=comfort_temp,
-            temperature=weather.get_temperature(),
-            wind_speed=weather.get_wind_speed()
-        )
-        
-        # Format clothing items for API response
-        # Extract relevant properties from each clothing recommendation
-        clothing_items = [
-            {
-                "name": item["name"],
-                "score": item["score"],
-                "category": item["category"],
-                "rainproof": item.get("rainproof"),
-                "windproof": item.get("windproof"),
-                "insulated": item.get("insulated")
-            }
-            for item in clothing_recs
-        ]
-        
-        # Build response
-        return RecommendationResponse(
-            weather=WeatherResponse(
-                temp_f=weather.get_temperature(),
-                wind_mph=weather.get_wind_speed(),
-                short_forecast=weather.get_short_forecast(),
-                location=weather.weather_data.get("location", "Unknown"),
-                period_start=weather.get_period_start(),
-                source="weather.gov"
-            ),
-            comfort_score=comfort_score,
-            clothing_recommendations=clothing_items,
-            location={"latitude": lat, "longitude": lon}
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to generate recommendations: {str(e)}"
-        )
+        # A2 — cache lookup
+        cached = _cache_lookup(db, lat, lon)
+        if cached:
+            weather_raw = cached.weather_data
+        else:
+            # A1 — async NWS fetch (A4: circuit breaker inside get_current_conditions)
+            weather_raw = await get_current_conditions(lat, lon)
+            _cache_upsert(db, lat, lon, weather_raw)
+
+    except pybreaker.CircuitBreakerError:
+        raise HTTPException(status_code=503, detail="Weather service temporarily unavailable")
+    except Exception:
+        logger.exception("NWS fetch failed for lat=%s lon=%s", lat, lon)
+        raise HTTPException(status_code=503, detail="Weather service temporarily unavailable")
+
+    weather = Weather.from_cache(weather_raw, lat, lon)
+    if not weather.is_ready():
+        raise HTTPException(status_code=404, detail="Weather data not available for this location")
+
+    comfort_score = score_weather(
+        weather,
+        comfort_temperature=comfort_temp,
+        cold_penalty_per_degree=cold_penalty,
+        heat_penalty_per_degree=heat_penalty,
+    )
+    clothing_recs = recommend_clothing(
+        comfort_temperature=comfort_temp,
+        temperature=weather.get_temperature(),
+        wind_speed=weather.get_wind_speed(),
+    )
+    clothing_items = [
+        {
+            "name": item["name"],
+            "score": item["score"],
+            "category": item["category"],
+            "rainproof": item.get("rainproof"),
+            "windproof": item.get("windproof"),
+            "insulated": item.get("insulated"),
+        }
+        for item in clothing_recs
+    ]
+
+    # A3 — record history fire-and-forget; runs after the response, adds no latency.
+    background_tasks.add_task(
+        _save_recommendation,
+        lat,
+        lon,
+        comfort_temp,
+        weather_raw,
+        comfort_score,
+        clothing_items,
+    )
+
+    return RecommendationResponse(
+        weather=WeatherResponse(
+            temp_f=weather.get_temperature(),
+            wind_mph=weather.get_wind_speed(),
+            short_forecast=weather.get_short_forecast(),
+            location=weather_raw.get("location", "Unknown"),
+            period_start=weather.get_period_start(),
+            source="weather.gov",
+        ),
+        comfort_score=comfort_score,
+        clothing_recommendations=clothing_items,
+        location={"latitude": lat, "longitude": lon},
+    )
 
 
-# Weather Endpoint
-@app.get("/weather/current", response_model=WeatherResponse)
-def get_current_weather(
-    latitude: float = Query(..., ge=-90, le=90, description="Latitude"),
-    longitude: float = Query(..., ge=-180, le=180, description="Longitude")
+# Weather Endpoint — async (A1)
+@api_router.get("/weather/current", response_model=WeatherResponse)
+async def get_current_weather(
+    latitude: float = Query(..., ge=-90, le=90),
+    longitude: float = Query(..., ge=-180, le=180),
 ):
-    """
-    Get current weather conditions for a location.
-    
-    Fetches raw weather data from the National Weather Service API without
-    calculating recommendations. Useful for debugging or displaying weather
-    information separately.
-    
-    Args:
-        latitude: Latitude coordinate (-90 to 90). Required.
-        longitude: Longitude coordinate (-180 to 180). Required.
-        
-    Returns:
-        WeatherResponse: Contains:
-            - temp_f: Temperature in Fahrenheit
-            - wind_mph: Wind speed in miles per hour
-            - short_forecast: Brief forecast description
-            - location: City and state name
-            - period_start: Timestamp of the weather period
-            - source: Data source (always "weather.gov")
-            
-    Raises:
-        HTTPException 500: If weather data cannot be fetched
-        
-    Example:
-        GET /weather/current?latitude=40.7128&longitude=-74.0060
-    """
     try:
-        from src.clients.nws_client import get_current_conditions
-        
-        weather_data = get_current_conditions(latitude, longitude)
-        
+        data = await get_current_conditions(latitude, longitude)
         return WeatherResponse(
-            temp_f=weather_data["temp_f"],
-            wind_mph=weather_data["wind_mph"],
-            short_forecast=weather_data["short_forecast"],
-            location=weather_data["location"],
-            period_start=weather_data["period_start"],
-            source=weather_data["source"]
+            temp_f=data["temp_f"],
+            wind_mph=data["wind_mph"],
+            short_forecast=data["short_forecast"],
+            location=data["location"],
+            period_start=data["period_start"],
+            source=data["source"],
         )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to fetch weather data: {str(e)}"
-        )
+    except pybreaker.CircuitBreakerError:
+        raise HTTPException(status_code=503, detail="Weather service temporarily unavailable")
+    except Exception:
+        logger.exception("Error in /weather/current for lat=%s lon=%s", latitude, longitude)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
-# Recommendations Endpoint (alias for /score)
-@app.get("/recommendations", response_model=RecommendationResponse)
-@app.post("/recommendations", response_model=RecommendationResponse)
-def get_recommendations(
-    latitude: Optional[float] = Query(None, ge=-90, le=90),
-    longitude: Optional[float] = Query(None, ge=-180, le=180),
-    comfort_temperature: Optional[float] = Query(None, ge=50, le=90),
-    request: Optional[RecommendationRequest] = None,
-    db: Session = Depends(get_db)
-):
-    """
-    Alias for /score endpoint.
-    
-    Provides an alternative endpoint name for getting clothing recommendations.
-    Functionally identical to /score endpoint.
-    
-    Args:
-        Same as get_score() function.
-        
-    Returns:
-        Same as get_score() function.
-    """
-    return get_score(latitude, longitude, comfort_temperature, request, db)
+# D2 — the legacy /recommendations duplicate was removed; /score is the single
+# canonical scoring route. (History persistence will be a separate route under A3.)
 
 
 # User Endpoints (optional - for future use)
-@app.post("/users", response_model=UserResponse)
+@api_router.post("/users", response_model=UserResponse)
 def create_user(user: UserCreate, db: Session = Depends(get_db)):
     """
     Create a new user.
@@ -404,11 +418,8 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
                         detail=f"Username or email already exists. Please try a different name."
                     )
             else:
-                # Other integrity error
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"User creation failed: {error_str}"
-                )
+                logger.exception("Unexpected IntegrityError creating user %s", base_username)
+                raise HTTPException(status_code=400, detail="User creation failed")
     
     # If we get here, all retries failed
     raise HTTPException(
@@ -417,7 +428,7 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
     )
 
 
-@app.get("/users/{user_id}", response_model=UserResponse)
+@api_router.get("/users/{user_id}", response_model=UserResponse)
 def get_user(user_id: int, db: Session = Depends(get_db)):
     """
     Get user by ID.
@@ -447,7 +458,7 @@ def get_user(user_id: int, db: Session = Depends(get_db)):
 
 
 # Database Test Endpoint - Comprehensive CRUD Testing
-@app.get("/db-test")
+@api_router.get("/db-test")
 def test_database_operations(db: Session = Depends(get_db)):
     """
     Comprehensive database connection and CRUD operations test.
@@ -587,5 +598,11 @@ def test_database_operations(db: Session = Depends(get_db)):
     return test_results
 
 
-
+# D3 — Dual-mount every business route under both the legacy unprefixed path and
+# /v1, so the frontend can migrate to /v1 without breaking the live deployment.
+# Legacy mounts can be removed once nothing depends on them.
+for _prefix in ("", "/v1"):
+    app.include_router(api_router, prefix=_prefix)
+    app.include_router(auth.router, prefix=_prefix)
+    app.include_router(settings.router, prefix=_prefix)
 

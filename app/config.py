@@ -40,3 +40,9 @@ DEBUG = os.getenv("DEBUG", "False").lower() == "true"
 APP_NAME = "Weather Clothing Recommendation API"
 APP_VERSION = "1.0.0"
 
+# JWT Configuration
+# Set JWT_SECRET to a long random string in production — never use the default
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-in-production")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))  # 24 hours
+

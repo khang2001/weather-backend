@@ -55,6 +55,16 @@ class RecommendationRequest(CoordinatesRequest):
         le=100,
         description="Personal comfort temperature in Fahrenheit (default: 70)"
     )
+    # SC3 — optional per-user asymmetric comfort (penalty per °F below/above
+    # comfort). Omit for symmetric 0.5/0.5 scoring.
+    cold_penalty_per_degree: Optional[float] = Field(
+        default=None, ge=0, le=2,
+        description="Comfort-score penalty per °F below comfort (default: 0.5)"
+    )
+    heat_penalty_per_degree: Optional[float] = Field(
+        default=None, ge=0, le=2,
+        description="Comfort-score penalty per °F above comfort (default: 0.5)"
+    )
 
 
 class UserCreate(BaseModel):
