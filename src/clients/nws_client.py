@@ -37,7 +37,11 @@ nws_breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=60)
 async def _do_get(url: str, params=None, max_attempts: int = 3) -> dict:
     """Async GET with exponential-backoff retries."""
     for attempt in range(1, max_attempts + 1):
-        async with httpx.AsyncClient(timeout=NWS_TIMEOUT, headers=NWS_HEADERS) as client:
+        # follow_redirects: NWS 301-redirects some requests (e.g. trailing-slash
+        # or normalized paths); without this they'd raise on raise_for_status().
+        async with httpx.AsyncClient(
+            timeout=NWS_TIMEOUT, headers=NWS_HEADERS, follow_redirects=True
+        ) as client:
             response = await client.get(url, params=params)
 
         if response.status_code in RETRYABLE_STATUS_CODES:
@@ -75,7 +79,11 @@ def _parse_wind_speed(raw: str) -> float:
 # --- Public API ---------------------------------------------------------------
 
 async def get_point(latitude: float, longitude: float) -> dict:
-    url = urljoin(NWS_BASE_URL, f"points/{latitude},{longitude}")
+    # NWS only accepts coordinates to 4 decimal places; more precision triggers a
+    # 301 redirect to the truncated form. Round up front to avoid the redirect and
+    # to normalize cache keys (browser geolocation sends ~15 decimals).
+    lat, lon = round(latitude, 4), round(longitude, 4)
+    url = urljoin(NWS_BASE_URL, f"points/{lat},{lon}")
     return await _get(url)
 
 
