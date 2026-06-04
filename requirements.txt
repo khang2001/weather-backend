@@ -10,6 +10,7 @@ bcrypt==4.0.1
 python-jose[cryptography]>=3.3.0
 httpx>=0.24.0
 pybreaker>=1.0.0
+tornado>=6.0  # required by pybreaker.call_async (@gen.coroutine); not auto-installed
 
 # Test dependencies
 pytest>=8.0.0
