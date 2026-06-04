@@ -35,7 +35,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-from app.config import APP_NAME, APP_VERSION
+from app.config import APP_NAME, APP_VERSION, DB_ENABLED
 from app.database import get_db, Base, engine
 from app.database.connection import SessionLocal
 from app.database.models import WeatherCache
@@ -136,18 +136,22 @@ def _save_recommendation(
 
 
 # Create database tables (in production, use Alembic migrations)
-# Wrap in try-except so server can start even if database isn't available
-try:
-    # Import models to register them on Base.metadata, then create tables.
-    # NOTE: do NOT call Base.metadata.clear() here — models are already imported
-    # (via app.database package init), so a clear() empties the registry and the
-    # cached re-import does not re-populate it, leaving create_all() a silent no-op.
-    from app.database.models import User, WeatherCache, Recommendation  # noqa: F401
-    Base.metadata.create_all(bind=engine)
-    print("✓ Database tables created/verified")
-except Exception as e:
-    print(f"⚠ Warning: Could not create database tables: {e}")
-    print("  Server will start, but database features may not work.")
+# Wrap in try-except so server can start even if database isn't available.
+# Skipped entirely when DB_ENABLED is false (no Postgres provisioned).
+if DB_ENABLED:
+    try:
+        # Import models to register them on Base.metadata, then create tables.
+        # NOTE: do NOT call Base.metadata.clear() here — models are already imported
+        # (via app.database package init), so a clear() empties the registry and the
+        # cached re-import does not re-populate it, leaving create_all() a silent no-op.
+        from app.database.models import User, WeatherCache, Recommendation  # noqa: F401
+        Base.metadata.create_all(bind=engine)
+        print("✓ Database tables created/verified")
+    except Exception as e:
+        print(f"⚠ Warning: Could not create database tables: {e}")
+        print("  Server will start, but database features may not work.")
+else:
+    print("ℹ DB_ENABLED=false — skipping table creation; DB features disabled.")
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -179,6 +183,13 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 api_router = APIRouter()
 
 
+def require_db() -> None:
+    """Guard for DB-only routes. When DB is disabled, fail fast with a clear 503
+    instead of letting a connection error surface as a generic 500."""
+    if not DB_ENABLED:
+        raise HTTPException(status_code=503, detail="Database features are temporarily disabled")
+
+
 # Health Check Endpoint
 @app.get("/", response_model=HealthResponse)
 @app.get("/health", response_model=HealthResponse)
@@ -199,13 +210,17 @@ def health_check(db: Session = Depends(get_db)):
         GET /health
         Response: {"status": "healthy", "version": "1.0.0", "database": "connected"}
     """
-    try:
-        # Test database connection with a simple query
-        db.execute(text("SELECT 1"))
-        db_status = "connected"
-    except Exception as e:
-        # Database connection failed, but API is still healthy
-        db_status = "disconnected"
+    if not DB_ENABLED:
+        # DB features intentionally disabled — don't attempt a connection.
+        db_status = "disabled"
+    else:
+        try:
+            # Test database connection with a simple query
+            db.execute(text("SELECT 1"))
+            db_status = "connected"
+        except Exception as e:
+            # Database connection failed, but API is still healthy
+            db_status = "disconnected"
 
     return HealthResponse(
         status="healthy",
@@ -233,14 +248,18 @@ async def get_score(
         comfort_temp = COMFORT_TEMPERATURE
 
     try:
-        # A2 — cache lookup
-        cached = _cache_lookup(db, lat, lon)
-        if cached:
-            weather_raw = cached.weather_data
-        else:
+        # A2 — cache lookup (DB-backed; skipped when DB is disabled)
+        weather_raw = None
+        if DB_ENABLED:
+            cached = _cache_lookup(db, lat, lon)
+            if cached:
+                weather_raw = cached.weather_data
+
+        if weather_raw is None:
             # A1 — async NWS fetch (A4: circuit breaker inside get_current_conditions)
             weather_raw = await get_current_conditions(lat, lon)
-            _cache_upsert(db, lat, lon, weather_raw)
+            if DB_ENABLED:
+                _cache_upsert(db, lat, lon, weather_raw)
 
     except pybreaker.CircuitBreakerError:
         raise HTTPException(status_code=503, detail="Weather service temporarily unavailable")
@@ -276,15 +295,17 @@ async def get_score(
     ]
 
     # A3 — record history fire-and-forget; runs after the response, adds no latency.
-    background_tasks.add_task(
-        _save_recommendation,
-        lat,
-        lon,
-        comfort_temp,
-        weather_raw,
-        comfort_score,
-        clothing_items,
-    )
+    # Skipped when DB is disabled (no table to write to).
+    if DB_ENABLED:
+        background_tasks.add_task(
+            _save_recommendation,
+            lat,
+            lon,
+            comfort_temp,
+            weather_raw,
+            comfort_score,
+            clothing_items,
+        )
 
     return RecommendationResponse(
         weather=WeatherResponse(
@@ -330,7 +351,7 @@ async def get_current_weather(
 
 # User Endpoints (optional - for future use)
 @api_router.post("/users", response_model=UserResponse)
-def create_user(user: UserCreate, db: Session = Depends(get_db)):
+def create_user(user: UserCreate, db: Session = Depends(get_db), _: None = Depends(require_db)):
     """
     Create a new user.
     
@@ -429,7 +450,7 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
 
 
 @api_router.get("/users/{user_id}", response_model=UserResponse)
-def get_user(user_id: int, db: Session = Depends(get_db)):
+def get_user(user_id: int, db: Session = Depends(get_db), _: None = Depends(require_db)):
     """
     Get user by ID.
     
@@ -459,7 +480,7 @@ def get_user(user_id: int, db: Session = Depends(get_db)):
 
 # Database Test Endpoint - Comprehensive CRUD Testing
 @api_router.get("/db-test")
-def test_database_operations(db: Session = Depends(get_db)):
+def test_database_operations(db: Session = Depends(get_db), _: None = Depends(require_db)):
     """
     Comprehensive database connection and CRUD operations test.
     
@@ -601,8 +622,11 @@ def test_database_operations(db: Session = Depends(get_db)):
 # D3 — Dual-mount every business route under both the legacy unprefixed path and
 # /v1, so the frontend can migrate to /v1 without breaking the live deployment.
 # Legacy mounts can be removed once nothing depends on them.
+# auth and settings are entirely DB-backed; when DB is disabled, attach the
+# require_db guard so their routes return a clean 503 instead of a 500.
+_db_only_guard = [] if DB_ENABLED else [Depends(require_db)]
 for _prefix in ("", "/v1"):
     app.include_router(api_router, prefix=_prefix)
-    app.include_router(auth.router, prefix=_prefix)
-    app.include_router(settings.router, prefix=_prefix)
+    app.include_router(auth.router, prefix=_prefix, dependencies=_db_only_guard)
+    app.include_router(settings.router, prefix=_prefix, dependencies=_db_only_guard)
 

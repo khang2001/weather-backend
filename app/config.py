@@ -24,6 +24,12 @@ DATABASE_URL = os.getenv(
     "postgresql://postgres:pukan2001@localhost:1234/weather_cloth_rec"
 )
 
+# Master switch for all database-backed features (weather cache, recommendation
+# history, user/settings/auth endpoints). Temporarily disabled while there is no
+# real Postgres provisioned — the app still serves weather + scoring without it.
+# To re-enable: set DB_ENABLED=true AND point DATABASE_URL at a real database.
+DB_ENABLED = os.getenv("DB_ENABLED", "false").lower() == "true"
+
 # API Configuration
 # Host address to bind the server (0.0.0.0 allows external connections)
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
