@@ -319,9 +319,15 @@ async def get_current_weather(
         )
     except pybreaker.CircuitBreakerError:
         raise HTTPException(status_code=503, detail="Weather service temporarily unavailable")
-    except Exception:
+    except Exception as exc:
         logger.exception("Error in /weather/current for lat=%s lon=%s", latitude, longitude)
-        raise HTTPException(status_code=500, detail="Internal server error")
+        # TEMP DIAGNOSTIC — surface the real upstream error so we can tell a
+        # 403/429 IP-block from a timeout. REMOVE after diagnosis.
+        detail = f"DEBUG {type(exc).__name__}: {str(exc)[:300]}"
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status is not None:
+            detail += f" [upstream_status={status}]"
+        raise HTTPException(status_code=500, detail=detail)
 
 
 # D2 — the legacy /recommendations duplicate was removed; /score is the single
