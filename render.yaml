@@ -1,0 +1,28 @@
+# Render infrastructure-as-code for the weather-backend service.
+# Docs: https://render.com/docs/blueprint-spec
+#
+# Secrets (NWS_CONTACT, JWT_SECRET, DATABASE_URL) use `sync: false` so their
+# values are set in the Render dashboard, never committed to the repo.
+services:
+  - type: web
+    name: weather-backend
+    runtime: python
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.web:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.6
+      - key: APP_NAME
+        value: WeatherLayers
+      # Required by api.weather.gov — set the real value in the dashboard.
+      - key: NWS_CONTACT
+        sync: false
+      # Long random string — set in the dashboard, never commit.
+      - key: JWT_SECRET
+        sync: false
+      # Real Postgres connection string — set in the dashboard.
+      - key: DATABASE_URL
+        sync: false
